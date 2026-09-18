@@ -1,0 +1,51 @@
+# syntax=docker/dockerfile:1
+# osquery — production agent node image (optional, used to validate
+# enrollment end-to-end from inside the compose network).
+#
+# Multi-stage build: a golang stage compiles osctrl-cli statically (the
+# agent bootstrap uses it to fetch its enroll secret and flags straight
+# from the database), an ubuntu stage installs osquery from the official
+# osquery package and runs the standard osctrl osquery entrypoint.
+
+######################################### builder (osctrl-cli) #########################################
+ARG GOLANG_VERSION=1.27.1
+ARG OSQUERY_VERSION=5.23.1
+FROM golang:${GOLANG_VERSION}-alpine AS builder
+
+ARG BUILD_COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
+
+COPY . .
+
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w -X main.buildCommit=${BUILD_COMMIT} -X main.buildDate=${BUILD_DATE}" \
+    -o /out/osctrl-cli ./cmd/cli
+
+######################################### osquery agent #########################################
+FROM ubuntu:24.04
+
+ARG OSQUERY_VERSION
+
+RUN apt-get update -y -q && \
+    apt-get install -y -q --no-install-recommends curl ca-certificates openssl && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    ubuntuArch="$(dpkg --print-architecture)"; \
+    curl -fsSL "https://pkg.osquery.io/deb/osquery_${OSQUERY_VERSION}-1.linux_${ubuntuArch}.deb" -o /tmp/osquery.deb; \
+    dpkg -i /tmp/osquery.deb; \
+    rm -f /tmp/osquery.deb
+
+RUN mkdir -p /opt/osctrl/bin
+COPY --from=builder /out/osctrl-cli /opt/osctrl/bin/osctrl-cli
+COPY deploy/docker/conf/osquery/entrypoint.sh /opt/osctrl/entrypoint.sh
+RUN chmod 0755 /opt/osctrl/entrypoint.sh
+
+# The bootstrap entrypoint writes /etc/osquery and needs root; the osquery
+# daemon then runs with the osquery user via its own privilege drop.
+ENTRYPOINT ["/opt/osctrl/entrypoint.sh"]

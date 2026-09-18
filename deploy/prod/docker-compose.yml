@@ -1,0 +1,363 @@
+# osctrl — production stack
+#
+#   osctrl-edge         nginx TLS termination for the osquery endpoint
+#   osctrl-frontend     nginx: React SPA + /api/* reverse proxy to osctrl-api
+#   osctrl-tls          osquery remote API (enroll/config/log/queries/carves)
+#   osctrl-api          REST API for the operator UI (JWT auth)
+#   osctrl-cli          one-shot bootstrap: environment + admin user
+#   osctrl-postgres     primary datastore
+#   osctrl-valkey       required runtime cache / shared state
+#   osquery-node-1      optional agent node (profile "osquery") to validate
+#                       enrollment end-to-end from inside the stack
+#
+# Network topology:
+#   edge    public-facing entrypoints (nginx) plus osctrl-api/osctrl-tls so
+#           the nginxs can reach them; this network is the only one with
+#           egress (osctrl log-sink integrations may need outbound traffic)
+#   backend datastores + bootstrap + agents; `internal: true` so nothing
+#           here can reach the internet and postgres/valkey are never
+#           reachable from the edge network
+#
+# All secrets come from ./.env (chmod 600, git-ignored). Certificates are
+# mounted read-only from ./secrets/ and never baked into images.
+
+name: osctrl
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  ######################################### PostgreSQL #########################################
+  osctrl-postgres:
+    image: postgres:${POSTGRES_VERSION}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB_NAME:?set in .env (see .env.example)}
+      POSTGRES_USER: ${POSTGRES_DB_USERNAME:?set in .env (see .env.example)}
+      POSTGRES_PASSWORD: ${POSTGRES_DB_PASSWORD:?set in .env (see .env.example)}
+    command: ["postgres", "-c", "max_connections=200"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_DB_USERNAME} -d ${POSTGRES_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+    logging: *default-logging
+    # No host port: the database is internal-only by design.
+
+  ######################################### Valkey #########################################
+  # Valkey is the Linux Foundation's open-source fork of Redis (RESP
+  # compatible) and serves as the required runtime cache / shared state.
+  # REDIS_HOST/REDIS_PASS are the osctrl binaries' flag names, not a
+  # statement about the server behind them.
+  osctrl-valkey:
+    image: valkey/valkey:${VALKEY_VERSION}
+    restart: unless-stopped
+    command:
+      - valkey-server
+      - --requirepass
+      - ${VALKEY_PASSWORD:?set in .env (see .env.example)}
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - allkeys-lfu
+    volumes:
+      - valkey-data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -a '${VALKEY_PASSWORD}' --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1g
+    logging: *default-logging
+    # No host port: the cache is internal-only by design.
+
+  ######################################### osctrl-cli (one-shot bootstrap) #########################################
+  osctrl-cli:
+    image: osctrl/cli:${OSCTRL_VERSION}
+    build:
+      context: ../..
+      dockerfile: deploy/prod/docker/Dockerfile.osctrl-cli
+      args:
+        GOLANG_VERSION: ${GOLANG_VERSION}
+        BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
+    restart: "no"
+    depends_on:
+      osctrl-postgres:
+        condition: service_healthy
+      osctrl-valkey:
+        condition: service_healthy
+    environment:
+      ENV_NAME: ${OSCTRL_ENV_NAME}
+      HOST: ${OSCTRL_TLS_HOST}
+      CERT_FILE: /opt/osctrl/config/osctrl.crt
+      OSCTRL_USER: ${OSCTRL_USER}
+      OSCTRL_PASS: ${OSCTRL_PASS:?set in .env (see .env.example)}
+      POSTURE_PROFILE: ${POSTURE_PROFILE:-linux-server}
+      POSTURE_INTERVAL: ${POSTURE_INTERVAL:-75}
+      POSTURE_QUERY_PREFIX: ${POSTURE_QUERY_PREFIX:-osctrl:posture:}
+      # Required to satisfy the pkg/users JWT secret length gate.
+      JWT_SECRET: ${JWT_SECRET:?set in .env (see .env.example)}
+      DB_HOST: osctrl-postgres
+      DB_NAME: ${POSTGRES_DB_NAME:?set in .env (see .env.example)}
+      DB_USER: ${POSTGRES_DB_USERNAME:?set in .env (see .env.example)}
+      DB_PASS: ${POSTGRES_DB_PASSWORD:?set in .env (see .env.example)}
+      REDIS_HOST: osctrl-valkey
+      REDIS_PASS: ${VALKEY_PASSWORD:?set in .env (see .env.example)}
+    volumes:
+      - ./secrets/osctrl.crt:/opt/osctrl/config/osctrl.crt:ro
+    networks:
+      - backend
+    logging: *default-logging
+
+  ######################################### osctrl-tls #########################################
+  osctrl-tls:
+    image: osctrl/tls:${OSCTRL_VERSION}
+    build:
+      context: ../..
+      dockerfile: deploy/prod/docker/Dockerfile.osctrl-tls
+      args:
+        GOLANG_VERSION: ${GOLANG_VERSION}
+        BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
+    restart: unless-stopped
+    depends_on:
+      osctrl-cli:
+        condition: service_completed_successfully
+      osctrl-postgres:
+        condition: service_healthy
+      osctrl-valkey:
+        condition: service_healthy
+    environment:
+      TZ: UTC
+      SERVICE_LISTENER: 0.0.0.0
+      SERVICE_PORT: "9000"
+      SERVICE_AUTH: none
+      SERVICE_LOGGER: ${OSCTRL_TLS_LOGGER:-db}
+      SERVICE_LOG_FORMAT: json
+      SERVICE_HEALTH_ENABLED: "true"
+      SERVICE_POSTURE_ENABLED: "true"
+      SERVICE_ALERTS_ENABLED: "true"
+      SERVICE_CONFIG_ENABLED: "true"
+      # Trust X-Forwarded-For from the compose networks (nginx sits there).
+      SERVICE_TRUSTED_PROXIES: ${OSCTRL_TRUSTED_PROXIES:-172.16.0.0/12}
+      OSQUERY_VERSION: ${OSQUERY_VERSION}
+      OSQUERY_ACCELERATED: "true"
+      OSQUERY_FILE_EXPLORER: "true"
+      DB_HOST: osctrl-postgres
+      DB_NAME: ${POSTGRES_DB_NAME:?set in .env (see .env.example)}
+      DB_USER: ${POSTGRES_DB_USERNAME:?set in .env (see .env.example)}
+      DB_PASS: ${POSTGRES_DB_PASSWORD:?set in .env (see .env.example)}
+      REDIS_HOST: osctrl-valkey
+      REDIS_PASS: ${VALKEY_PASSWORD:?set in .env (see .env.example)}
+      # Target for the static healthcheck probe (no shell in distroless).
+      HEALTHCHECK_ADDR: 127.0.0.1:9000
+    networks:
+      - backend
+      - edge
+    healthcheck:
+      test: ["CMD", "/opt/osctrl/bin/healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 1g
+    logging: *default-logging
+    # No host port: agents reach it through osctrl-edge.
+
+  ######################################### osctrl-api #########################################
+  osctrl-api:
+    image: osctrl/api:${OSCTRL_VERSION}
+    build:
+      context: ../..
+      dockerfile: deploy/prod/docker/Dockerfile.osctrl-api
+      args:
+        GOLANG_VERSION: ${GOLANG_VERSION}
+        BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
+    restart: unless-stopped
+    depends_on:
+      osctrl-cli:
+        condition: service_completed_successfully
+      osctrl-postgres:
+        condition: service_healthy
+      osctrl-valkey:
+        condition: service_healthy
+    environment:
+      TZ: UTC
+      SERVICE_LISTENER: 0.0.0.0
+      SERVICE_PORT: "9002"
+      SERVICE_AUTH: jwt
+      JWT_SECRET: ${JWT_SECRET:?set in .env (see .env.example)}
+      SERVICE_LOGGER: db
+      SERVICE_LOG_FORMAT: json
+      SERVICE_HEALTH_ENABLED: "true"
+      SERVICE_POSTURE_ENABLED: "true"
+      SERVICE_ALERTS_ENABLED: "true"
+      SERVICE_CONFIG_ENABLED: "true"
+      SERVICE_TRUSTED_PROXIES: ${OSCTRL_TRUSTED_PROXIES:-172.16.0.0/12}
+      OSQUERY_VERSION: ${OSQUERY_VERSION}
+      OSQUERY_TABLES: /opt/osctrl/data/${OSQUERY_VERSION}.json
+      OSQUERY_CONSOLE: "true"
+      OSQUERY_FILE_EXPLORER: "true"
+      DB_HOST: osctrl-postgres
+      DB_NAME: ${POSTGRES_DB_NAME:?set in .env (see .env.example)}
+      DB_USER: ${POSTGRES_DB_USERNAME:?set in .env (see .env.example)}
+      DB_PASS: ${POSTGRES_DB_PASSWORD:?set in .env (see .env.example)}
+      REDIS_HOST: osctrl-valkey
+      REDIS_PASS: ${VALKEY_PASSWORD:?set in .env (see .env.example)}
+      # Target for the static healthcheck probe (no shell in distroless).
+      HEALTHCHECK_ADDR: 127.0.0.1:9002
+    networks:
+      - backend
+      - edge
+    healthcheck:
+      test: ["CMD", "/opt/osctrl/bin/healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 1g
+    logging: *default-logging
+    # No host port: the UI reaches it through osctrl-frontend.
+
+  ######################################### osctrl-frontend (React SPA) #########################################
+  osctrl-frontend:
+    image: osctrl/frontend:${OSCTRL_VERSION}
+    build:
+      context: ../..
+      dockerfile: deploy/prod/docker/Dockerfile.osctrl-frontend
+      args:
+        NODE_VERSION: ${NODE_VERSION}
+        NGINX_VERSION: ${NGINX_VERSION}
+    restart: unless-stopped
+    environment:
+      # 1 = HTTPS on :443 using ./secrets/osctrl.{crt,key}; 0 = plain HTTP
+      # on :80 for an external TLS terminator.
+      OSCTRL_FRONTEND_TLS: ${OSCTRL_FRONTEND_TLS:-1}
+    ports:
+      # Host port is configurable; container :443 (or :80 in HTTP mode —
+      # adjust the mapping to ${OSCTRL_UI_PORT:-80}:80 in that case).
+      - "${OSCTRL_UI_PORT:-8443}:443"
+    volumes:
+      - ./secrets/osctrl.crt:/etc/ssl/osctrl/tls.crt:ro
+      - ./secrets/osctrl.key:/etc/ssl/osctrl/tls.key:ro
+    depends_on:
+      osctrl-api:
+        condition: service_healthy
+    networks:
+      - edge
+    healthcheck:
+      # Works in both TLS and HTTP modes (TLS mode redirects :80 → :443).
+      test: ["CMD-SHELL", "nginx -t && { wget -q --spider http://127.0.0.1/ || wget -q --spider --no-check-certificate https://127.0.0.1/; }"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *default-logging
+
+  ######################################### osctrl-edge (osquery endpoint) #########################################
+  osctrl-edge:
+    image: osctrl/edge:${OSCTRL_VERSION}
+    build:
+      context: ../..
+      dockerfile: deploy/prod/docker/Dockerfile.osctrl-edge
+      args:
+        NGINX_VERSION: ${NGINX_VERSION}
+    restart: unless-stopped
+    ports:
+      - "${OSCTRL_TLS_PORT:-443}:443"
+    volumes:
+      - ./secrets/osctrl.crt:/etc/ssl/osctrl/tls.crt:ro
+      - ./secrets/osctrl.key:/etc/ssl/osctrl/tls.key:ro
+    depends_on:
+      osctrl-tls:
+        condition: service_healthy
+    networks:
+      edge:
+        # Lets in-stack agents (and /etc/hosts entries) reach the edge by
+        # the same public hostname the fleet is configured for.
+        aliases:
+          - ${OSCTRL_TLS_HOST}
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t && wget -q --spider --no-check-certificate https://127.0.0.1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *default-logging
+
+  ######################################### osquery node (optional test agent) #########################################
+  # Not started by default. Enable with:
+  #   docker compose --profile osquery up -d
+  osquery-node-1:
+    image: osctrl/osquery:${OSQUERY_VERSION}
+    profiles: ["osquery"]
+    build:
+      context: ../..
+      dockerfile: deploy/prod/docker/Dockerfile.osquery
+      args:
+        GOLANG_VERSION: ${GOLANG_VERSION}
+        OSQUERY_VERSION: ${OSQUERY_VERSION}
+        BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
+    restart: unless-stopped
+    depends_on:
+      osctrl-cli:
+        condition: service_completed_successfully
+      osctrl-edge:
+        condition: service_healthy
+    environment:
+      ENV_NAME: ${OSCTRL_ENV_NAME}
+      # Resolved via the network alias on osctrl-edge.
+      HOST: ${OSCTRL_TLS_HOST}
+      DB_HOST: osctrl-postgres
+      DB_NAME: ${POSTGRES_DB_NAME:?set in .env (see .env.example)}
+      DB_USER: ${POSTGRES_DB_USERNAME:?set in .env (see .env.example)}
+      DB_PASS: ${POSTGRES_DB_PASSWORD:?set in .env (see .env.example)}
+      REDIS_HOST: osctrl-valkey
+      REDIS_PASS: ${VALKEY_PASSWORD:?set in .env (see .env.example)}
+    volumes:
+      - osquery-node-1-data:/var/osquery
+    networks:
+      - backend
+      - edge
+    logging: *default-logging
+
+networks:
+  # Datastores and bootstrap: no egress, never reachable from the edge net.
+  backend:
+    internal: true
+  # Public entrypoints plus the services they proxy.
+  edge:
+
+volumes:
+  postgres-data:
+  valkey-data:
+  osquery-node-1-data:
