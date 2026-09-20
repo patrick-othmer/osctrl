@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+# osctrl-api — production image.
+#
+# Multi-stage build: a golang stage compiles a fully static binary from
+# source, a distroless runtime stage ships only the binary, the osquery
+# table catalog, the CA bundle, and the healthcheck probe — no shell, no
+# package manager, no libc. Runs as the distroless `nonroot` user.
+
+######################################### builder #########################################
+ARG GOLANG_VERSION=1.27.1
+FROM golang:${GOLANG_VERSION}-alpine AS builder
+
+ARG BUILD_COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
+
+COPY . .
+
+# Static binaries: no libc, no toolchain, no source left behind.
+# The healthcheck probe is what distroless uses in place of a shell.
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w -X main.buildCommit=${BUILD_COMMIT} -X main.buildDate=${BUILD_DATE}" \
+    -o /out/osctrl-api ./cmd/api && \
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" \
+    -o /out/healthcheck ./deploy/prod/docker/healthcheck && \
+    touch /tmp/.keep
+
+######################################### runtime #########################################
+FROM gcr.io/distroless/static-debian12:nonroot
+
+# Outbound TLS (carve S3, log-sink integrations) needs a trust store;
+# distroless ships none, Go reads this exact path.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# Distroless has no /tmp; the service needs a writable one (carve temp
+# files). COPY is the only way to create directories without a shell.
+COPY --from=builder --chown=nonroot:nonroot --chmod=755 /tmp/.keep /tmp/.keep
+
+COPY --from=builder --chmod=755 /out/osctrl-api /opt/osctrl/bin/osctrl-api
+COPY deploy/osquery/data/ /opt/osctrl/data/
+COPY --from=builder --chmod=755 /out/healthcheck /opt/osctrl/bin/healthcheck
+
+USER nonroot
+WORKDIR /opt/osctrl
+
+EXPOSE 9002
+
+ENTRYPOINT ["/opt/osctrl/bin/osctrl-api"]

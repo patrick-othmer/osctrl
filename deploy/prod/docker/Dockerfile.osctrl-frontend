@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1
+# osctrl-frontend — production image.
+#
+# Multi-stage build: a node stage compiles the Vite/React SPA, a nginx stage
+# serves the hashed assets and reverse-proxies /api/* to osctrl-api:9002.
+# TLS is selected at runtime by the entrypoint via OSCTRL_FRONTEND_TLS:
+#   0 (default) — HTTP on :80, for use behind an external TLS terminator
+#   1           — HTTPS on :443 (HTTP→HTTPS redirect on :80), expecting
+#                 certs mounted at /etc/ssl/osctrl/tls.{crt,key}
+
+######################################### build #########################################
+ARG NODE_VERSION=22
+ARG NGINX_VERSION=1.31-alpine
+FROM node:${NODE_VERSION}-alpine AS frontend-builder
+
+WORKDIR /build
+
+# Install dependencies first to keep this layer cached while src/ churns.
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; \
+    else npm install --no-audit --no-fund; fi
+
+COPY frontend/ .
+RUN npm run build
+
+######################################### runtime #########################################
+FROM nginx:${NGINX_VERSION}
+
+# nginx master runs as root (needed to bind :443); workers drop to the
+# `nginx` user via the base image's user directive, and the web root is
+# chowned to nginx so no privileged write is needed at runtime.
+# Placeholder cert files so the host bind mounts land on files: some runc
+# versions auto-create missing mount destinations as directories, which
+# makes the file mount fail with a not-a-directory error.
+RUN rm -f /etc/nginx/conf.d/default.conf && \
+    mkdir -p /etc/nginx/conf.d-available /etc/ssl/osctrl && \
+    touch /etc/ssl/osctrl/tls.crt /etc/ssl/osctrl/tls.key
+
+# Stage both server blocks outside conf.d so only the one selected by the
+# entrypoint is active. The prod confs resolve the osctrl-api upstream per
+# request (Docker embedded DNS) so recreating osctrl-api never leaves this
+# server pinned to a dead container IP.
+COPY deploy/prod/conf/nginx/frontend.conf     /etc/nginx/conf.d-available/osctrl-frontend.conf
+COPY deploy/prod/conf/nginx/frontend-tls.conf /etc/nginx/conf.d-available/osctrl-frontend-tls.conf
+COPY deploy/cicd/nginx/docker-entrypoint-frontend.sh /docker-entrypoint-frontend.sh
+
+COPY --from=frontend-builder /build/dist/ /usr/share/nginx/osctrl-frontend/
+
+RUN chmod +x /docker-entrypoint-frontend.sh && \
+    chown -R nginx:nginx /usr/share/nginx/osctrl-frontend
+
+ENV OSCTRL_FRONTEND_TLS=0
+
+EXPOSE 80
+EXPOSE 443
+
+ENTRYPOINT ["/docker-entrypoint-frontend.sh"]

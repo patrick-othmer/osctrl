@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1
+# osctrl-cli — production bootstrap image.
+#
+# Multi-stage build: a golang stage compiles the CLI statically, the runtime
+# stage runs the one-shot bootstrap entrypoint (create environment + admin
+# user) as an unprivileged user. The container exits after bootstrapping;
+# compose wires it as a one-time dependency of osctrl-tls/osctrl-api.
+
+######################################### builder #########################################
+ARG GOLANG_VERSION=1.27.1
+FROM golang:${GOLANG_VERSION}-alpine AS builder
+
+ARG BUILD_COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
+
+COPY . .
+
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w -X main.buildCommit=${BUILD_COMMIT} -X main.buildDate=${BUILD_DATE}" \
+    -o /out/osctrl-cli ./cmd/cli
+
+######################################### runtime #########################################
+FROM alpine:3.22
+
+RUN apk add --no-cache ca-certificates tzdata && \
+    addgroup -g 10001 osctrl && \
+    adduser -D -H -u 10001 -G osctrl -s /sbin/nologin osctrl && \
+    mkdir -p /opt/osctrl/bin /opt/osctrl/config && \
+    # placeholder so the host cert bind mount lands on a file: some runc
+    # versions auto-create missing mount destinations as directories,
+    # which makes the file mount fail with a not-a-directory error
+    touch /opt/osctrl/config/osctrl.crt
+
+COPY --from=builder /out/osctrl-cli /opt/osctrl/bin/osctrl-cli
+COPY deploy/prod/conf/cli/entrypoint.sh /opt/osctrl/entrypoint.sh
+RUN chmod 0755 /opt/osctrl/entrypoint.sh
+
+USER osctrl
+WORKDIR /opt/osctrl
+
+ENTRYPOINT ["/opt/osctrl/entrypoint.sh"]
