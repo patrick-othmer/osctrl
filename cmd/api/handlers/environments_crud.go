@@ -418,7 +418,7 @@ func (h *HandlersApi) EnvironmentConfigPatchHandler(w http.ResponseWriter, r *ht
 		apiErrorResponse(w, "error parsing PATCH body", http.StatusBadRequest, err)
 		return
 	}
-	// Validate every supplied section is parseable JSON, and canonicalize
+	// Validate every supplied JSON section is parseable, and canonicalize
 	// each value (trim whitespace, "" → "{}") into `normalized` so the
 	// persistence calls below share the same source of truth as the
 	// validation. Without this, the validator accepts an empty string
@@ -426,6 +426,13 @@ func (h *HandlersApi) EnvironmentConfigPatchHandler(w http.ResponseWriter, r *ht
 	// write the original empty string to the DB — downstream parsers
 	// (osquery config generation, admin JSON view) trip on the empty
 	// string and behave inconsistently with the validated shape.
+	//
+	// `flags` is excluded: it is a plaintext osquery flags file
+	// (--flag=value lines with __SECRET_FILE__/__CERT_FILE__ placeholders),
+	// served raw to nodes and embedded verbatim in the enroll scripts.
+	// Nothing in the pipeline parses it as JSON, and JSON-validating it
+	// rejects every real flags edit from the SPA (the `--` prefix makes
+	// the parser fail with `invalid character '-' in numeric literal`).
 	sections := map[string]*string{
 		"options":    body.Options,
 		"schedule":   body.Schedule,
@@ -440,6 +447,10 @@ func (h *HandlersApi) EnvironmentConfigPatchHandler(w http.ResponseWriter, r *ht
 			continue
 		}
 		s := strings.TrimSpace(*val)
+		if name == "flags" {
+			normalized[name] = s
+			continue
+		}
 		if s == "" {
 			s = "{}"
 		}
