@@ -123,6 +123,36 @@ Back up `postgres-data` with `pg_dump` and rotate the certificates under
 `./secrets/` before they expire; the stack picks up new cert files on the
 next `docker compose up -d`.
 
+## Troubleshooting
+
+`osctrl.crt`/`osctrl.key` are intentionally not in git. If a container
+fails to start with:
+
+```
+error mounting ".../secrets/osctrl.crt" to rootfs at
+"/opt/osctrl/config/osctrl.crt": ... Are you trying to mount a directory
+onto a file (or vice-versa)?
+```
+
+the certificate files were missing and Docker auto-created them as
+**directories**. Fix:
+
+```bash
+# remove the empty directories Docker created
+rmdir secrets/osctrl.crt secrets/osctrl.key
+
+# generate the real certificates (see section 2 above)
+openssl req -x509 -newkey rsa:4096 -sha256 -days 825 -nodes \
+    -keyout secrets/osctrl.key -out secrets/osctrl.crt \
+    -subj "/CN=<OSCTRL_TLS_HOST>" \
+    -addext "subjectAltName=DNS:<OSCTRL_TLS_HOST>,IP:127.0.0.1"
+chmod 600 secrets/osctrl.key
+
+# verify both are regular files, then retry
+file secrets/osctrl.crt secrets/osctrl.key
+docker compose up -d
+```
+
 ## Security notes
 
 - `osctrl-tls` and `osctrl-api` run on `gcr.io/distroless/static:nonroot`
