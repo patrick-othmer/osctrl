@@ -30,7 +30,11 @@ FROM alpine:3.22
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -g 10001 osctrl && \
     adduser -D -H -u 10001 -G osctrl -s /sbin/nologin osctrl && \
-    mkdir -p /opt/osctrl/bin /opt/osctrl/config
+    mkdir -p /opt/osctrl/bin /opt/osctrl/config && \
+    # placeholder so the host cert bind mount lands on a file: some runc
+    # versions auto-create missing mount destinations as directories,
+    # which makes the file mount fail with a not-a-directory error
+    touch /opt/osctrl/config/osctrl.crt
 
 COPY --from=builder /out/osctrl-cli /opt/osctrl/bin/osctrl-cli
 COPY deploy/prod/conf/cli/entrypoint.sh /opt/osctrl/entrypoint.sh
